@@ -1,6 +1,6 @@
 # ANTS Lite — 精简落地方案
 
-> **版本**：v0.1  
+> **版本**：v0.2  
 > **日期**：2026-03-02  
 > **定位**：可落地的精简版，不追求"大而全"，先跑通核心价值
 
@@ -10,11 +10,13 @@
 
 1. [为什么要精简](#1-为什么要精简)
 2. [两个核心目标](#2-两个核心目标)
-3. [精简架构](#3-精简架构)
-4. [资料共享机制](#4-资料共享机制)
-5. [人工干预与纠偏机制](#5-人工干预与纠偏机制)
-6. [最小可验证设计（MVP）详细设计](#6-最小可验证设计mvp详细设计)
-7. [与完整版的关系](#7-与完整版的关系)
+3. [精简架构与并行规则](#3-精简架构与并行规则)
+4. [共享资料库详细结构](#4-共享资料库详细结构)
+5. [Agent 注册与动态增减](#5-agent-注册与动态增减)
+6. [人工干预机制（阶段边界模型）](#6-人工干预机制阶段边界模型)
+7. [Agent 角色定义与自我进化](#7-agent-角色定义与自我进化)
+8. [最小可验证设计（MVP）详细设计](#8-最小可验证设计mvp详细设计)
+9. [与完整版的关系](#9-与完整版的关系)
 
 ---
 
@@ -27,7 +29,7 @@
 |----------|------|
 | **目标驱动** | 只保留支撑两个核心目标的最小模块集 |
 | **依赖轻量** | 优先用本地文件/SQLite，而非 Redis/Kafka |
-| **可穿插人工** | 任意节点都允许人随时介入修正 |
+| **阶段边界审批** | 人工在阶段完成后审批，而非在 AI 执行中随意打断 |
 | **渐进扩展** | 先跑通，再按需叠加生产级特性 |
 
 ---
@@ -37,8 +39,14 @@
 ### 目标一：开发新项目
 
 ```
-人类 → 描述需求 → ANTS → [规划 → 编码 → 测试 → 总结] → 交付代码
-             ↑__________________________|（随时纠偏）
+人类 → 描述需求 → ANTS
+  阶段1: Planner  → 生成任务清单
+         ↓ ⏸ [人工审批：确认 / 修改任务]
+  阶段2: Coder × N → 并行编写代码模块
+         ↓ ⏸ [人工审批：浏览 diff / 可终止]
+  阶段3: Reviewer + Tester → 质检
+         ↓ ⏸ [人工审批：接受交付 / 要求重做]
+       → 交付代码
 ```
 
 涉及的典型 Agent：
@@ -50,8 +58,14 @@
 ### 目标二：维护老项目
 
 ```
-人类 → 描述问题/需求 → ANTS → [读取代码库 → 定位 → 修改 → 验证] → 交付补丁
-                ↑_______________________________________________|（随时纠偏）
+人类 → 描述问题/需求 → ANTS
+  阶段1: Planner → 索引代码库，定位相关文件，生成修改方案
+         ↓ ⏸ [人工审批：确认定位是否正确]
+  阶段2: Coder → 生成最小变更 patch
+         ↓ ⏸ [人工审批：浏览 diff]
+  阶段3: Tester → 运行回归测试，验证无破坏
+         ↓ ⏸ [人工审批：接受 / 拒绝]
+       → 交付补丁
 ```
 
 额外需要的能力：
@@ -61,7 +75,7 @@
 
 ---
 
-## 3. 精简架构
+## 3. 精简架构与并行规则
 
 相比完整版，砍掉 Kafka、Redis Cluster、K8s、Vault 等重量级依赖，
 用最小栈把核心流程跑通：
@@ -111,173 +125,390 @@
 | 向量数据库（Qdrant） | 代码索引文件 + BM25 | 代码检索先用关键词搜索 |
 | OpenTelemetry + Jaeger | 结构化日志（文件） | 先用日志代替全链路追踪 |
 
+### 3.1 Agent 并行规则
+
+**核心原则：无依赖的任务可以并行，有依赖的任务必须串行。**
+
+Orchestrator 在每个调度周期找到所有"依赖已全部完成"的待执行任务，
+批量并发启动，用 `asyncio.gather()` 等待本批次全部完成后再进入下一批次。
+
+```
+任务依赖图示例：
+
+task_001 (分析代码库)
+    │
+    ├──► task_002 (实现模块 A)  ─┐
+    │                            ├── 并行执行（互不依赖）
+    └──► task_003 (实现模块 B)  ─┘
+              │
+              └──► task_004 (集成测试)  ← 必须等 002 和 003 全部完成
+```
+
+| 情形 | 是否并行 | 说明 |
+|------|----------|------|
+| 多个 Coder 写互不相关的模块/文件 | ✅ 可并行 | `depends_on` 列表无交集 |
+| 多个 Reviewer 分别审查不同文件 | ✅ 可并行 | 读操作无冲突 |
+| Coder 写代码 + Tester 同时测试同一文件 | ❌ 不可并行 | 写后才能测 |
+| 同一文件有两个 Coder 修改 | ❌ 不可并行 | 写冲突 |
+| Planner 规划 + Coder 执行 | ❌ 不可并行 | Coder 依赖 Planner 输出 |
+
+**并发安全保证**：共享资料层的每个文件有明确的"唯一写入者"（见第 4 节），
+并行 Agent 不会同时写入同一文件，因此无需加锁。
+
 ---
 
-## 4. 资料共享机制
+## 4. 共享资料库详细结构
 
 多 Agent 协作的核心挑战：**每个 Agent 只看到自己的上下文，但需要基于共同的"世界观"工作。**
 
-### 4.1 共享资料的三层结构
+### 4.1 目录布局
+
+所有共享资料集中在项目根目录下的 `.ants/` 文件夹，结构固定：
 
 ```
-┌─────────────────────────────────────────┐
-│  Layer 3: 领域知识（只读，人工维护）        │
-│  • 项目背景文档、架构决策记录（ADR）        │
-│  • 编码规范、测试规范                      │
-│  • 第三方 API 文档摘要                    │
-└─────────────────────────────────────────┘
-┌─────────────────────────────────────────┐
-│  Layer 2: 项目状态（读写，Agent 维护）      │
-│  • 代码库文件树 + 函数/类索引              │
-│  • 任务清单（含状态：待做/进行中/完成）      │
-│  • 当前 PR / Issue 列表                  │
-└─────────────────────────────────────────┘
-┌─────────────────────────────────────────┐
-│  Layer 1: 会话上下文（读写，本次任务专属）  │
-│  • 本次任务目标和约束                     │
-│  • 已完成步骤的摘要输出                   │
-│  • 待处理问题列表                        │
-└─────────────────────────────────────────┘
+<project_root>/
+└── .ants/
+    ├── knowledge/                  # 【只读】领域知识，由人工维护
+    │   ├── project_spec.md         # 项目背景、目标、约束说明
+    │   ├── coding_style.md         # 编码规范（语言风格、命名约定等）
+    │   ├── arch_decisions/         # 架构决策记录（ADR）
+    │   │   └── 001-use-fastapi.md
+    │   └── api_docs/               # 第三方 API 文档摘要（按需放入）
+    │
+    ├── project_state/              # 【读写】项目级持久状态，跨会话共享
+    │   ├── codebase_index.json     # 代码库符号索引（首次建立，增量更新）
+    │   ├── agent_lessons.json      # 各 Agent 积累的项目经验（见第 7 节）
+    │   └── known_issues.json       # 已知问题列表（可选）
+    │
+    └── sessions/                   # 【读写】每次任务一个子目录
+        └── session_<timestamp>/
+            ├── goal.md             # 本次任务目标（人工填写，Agent 只读）
+            ├── tasks.json          # 任务清单（Planner 生成，Orchestrator 更新状态）
+            ├── session_memory.md   # 步骤摘要流水（各 Agent 追加，所有人可读）
+            ├── human_log.md        # 人工审批记录（时间戳 + 意见）
+            └── outputs/            # 各 Agent 的输出文件（唯一写入者见下表）
+                ├── plan.json       # Planner 输出
+                ├── code_diff.md    # Coder 输出
+                ├── review.json     # Reviewer 输出
+                └── test_result.json# Tester 输出
 ```
 
-### 4.2 数据流：Agent 如何读写共享资料
+### 4.2 文件与写入者对应表
+
+| 文件 | 唯一写入 Agent | 其他 Agent 权限 | 说明 |
+|------|--------------|-----------------|------|
+| `knowledge/**` | 人工 | 只读 | 项目启动前一次性准备，或随项目演进人工补充 |
+| `project_state/codebase_index.json` | Planner | 只读 | 每次会话开始时 Planner 检查并增量更新 |
+| `project_state/agent_lessons.json` | 各 Agent（追加自己的条目） | 只读 | 自进化数据，详见第 7 节 |
+| `sessions/*/goal.md` | 人工 | 只读 | 本次任务唯一来源 |
+| `sessions/*/tasks.json` | Planner（生成） + Orchestrator（更新状态） | 只读 | 所有 Agent 从这里获取自己的任务 |
+| `sessions/*/session_memory.md` | 所有 Agent（追加本步摘要） | 追加 | 追加模式，不覆盖，保证历史完整 |
+| `sessions/*/outputs/plan.json` | Planner | 只读 | — |
+| `sessions/*/outputs/code_diff.md` | Coder | 只读 | — |
+| `sessions/*/outputs/review.json` | Reviewer | 只读 | — |
+| `sessions/*/outputs/test_result.json` | Tester | 只读 | — |
+
+### 4.3 Agent 如何使用共享资料
+
+每个 Agent 执行前接收的上下文 = 以下三部分的拼接，由 Orchestrator 组装后传入：
 
 ```
-  Planner 生成任务清单
-       │
-       ▼
-  tasks.json ──────────────────────────────────┐
-       │                                        │
-  Coder 读取任务 → 修改代码 → 写入 code_diff.md │
-       │                                        │
-  Reviewer 读取 code_diff.md → 写入 review.json │
-       │                                        │
-  Tester 读取变更 → 运行测试 → 写入 test_result.json
-       │
-  Supervisor 读取所有输出 → 汇总 → 向人报告
+system_prompt（来自 Agent 角色定义，见第 7 节）
+    +
+知识包（knowledge/ 相关文件 + agent_lessons 中本 Agent 的经验）
+    +
+当前任务（tasks.json 中分配给本 Agent 的任务）
+    +
+会话记忆（session_memory.md，了解前序步骤的结果）
+    +
+必要的代码片段（由 codebase_index 检索，只取相关文件/函数，不传整个代码库）
 ```
 
-实现要点：
-- **每个 Agent 只写自己负责的文件**，其他文件只读 → 避免并发冲突
-- **文件格式用 JSON/Markdown**，LLM 天然擅长读写
-- **增量写入**：用 append 模式写日志，用 replace 模式写状态文件
-
-### 4.3 老项目的代码库索引
-
-老项目维护时，Agent 需要快速定位代码，不能让 LLM 读完整个代码库：
+### 4.4 代码库索引（老项目关键能力）
 
 ```python
-# 代码库索引结构（context/codebase_index.json）
+# codebase_index.json 结构
 {
+  "built_at": "2026-03-02T10:00:00",
   "files": [
     {
       "path": "src/auth/login.py",
+      "language": "python",
       "symbols": ["login_user", "validate_token", "LoginForm"],
       "summary": "用户登录逻辑，包含 JWT 验证",
-      "last_modified": "2026-02-20"
-    },
-    ...
+      "line_count": 120,
+      "last_modified": "2026-02-20",
+      "imports": ["src.models.user", "src.utils.jwt"]
+    }
   ],
-  "dependencies": {
+  "dependency_graph": {
     "src/auth/login.py": ["src/models/user.py", "src/utils/jwt.py"]
   }
 }
 ```
 
-建立索引的方式（选其一）：
-1. **Tree-sitter**：精准提取所有语言的符号表（推荐）
-2. **ctags**：轻量工具，支持多语言
-3. **LLM 摘要**：首次运行时逐文件生成摘要，缓存到文件
+建立/更新索引的方式：
+1. **Python AST**：纯标准库，解析 Python 文件符号（MVP 首选）
+2. **Tree-sitter**：支持多语言，精度更高（后续升级）
+3. **LLM 摘要**：对 AST 无法提取语义的文件（如配置文件），用 LLM 生成一行摘要并缓存
 
 ---
 
-## 5. 人工干预与纠偏机制
+## 5. Agent 注册与动态增减
 
-**核心设计理念**：人不是在任务"卡住"时才介入，而是**随时都能穿插进来纠偏**。
+### 5.1 Agent 注册表
 
-### 5.1 干预时机
+所有 Agent 的元数据统一存储在 `.ants/agents/registry.yaml`。
+这是整个系统"有哪些 Agent 可用"的唯一权威来源。
 
-| 干预时机 | 触发方式 | 人工可做的操作 |
-|----------|----------|----------------|
-| **任务规划完成后** | 自动暂停（可配置） | 修改/删除/增加任务 |
-| **单步完成后** | 查看输出，主动插入 | 追加指令、修正输出、跳过/重做某步 |
-| **Agent 遇到不确定时** | Agent 主动询问 | 澄清需求、提供缺失信息 |
-| **质量检查不通过时** | 自动暂停 | 接受/拒绝/手动修改后继续 |
-| **任意时刻** | 发送中断信号 | 终止/暂停，修改目标后重新启动 |
+```yaml
+# .ants/agents/registry.yaml
+agents:
+  - id: planner
+    role_file: roles/planner.yaml
+    model: gpt-4o                  # 用大模型做规划
+    enabled: true
 
-### 5.2 干预接口设计
+  - id: coder
+    role_file: roles/coder.yaml
+    model: gpt-4o-mini
+    enabled: true
+    max_parallel: 4                # 最多同时启动 4 个 Coder 实例
 
-人工干预通过**统一的指令通道**注入，Agent 在每轮循环开始前检查：
+  - id: reviewer
+    role_file: roles/reviewer.yaml
+    model: gpt-4o-mini
+    enabled: true
 
-```
-人类输入
-    │
-    ▼
-┌──────────────────────────────────────────────┐
-│              HIL Gateway（人工干预网关）        │
-│                                               │
-│  • 标准指令：pause / resume / abort           │
-│  • 纠偏指令：inject "你漏掉了错误处理"         │
-│  • 替换指令：replace_task "3" "改用 async/await │
-│  • 回滚指令：rollback_to "step_2"             │
-└──────────────────────────────────────────────┘
-    │
-    ▼
-Orchestrator 在下一个 Agent 调度前处理干预指令
-```
+  - id: tester
+    role_file: roles/tester.yaml
+    model: gpt-4o-mini
+    enabled: false                 # MVP 阶段暂不启用
 
-### 5.3 干预的实现方式（Lite 版）
-
-**方式一：命令行交互式模式**（最简单）
-
-```bash
-$ ants run --task "给 login 模块加速率限制"
-[ANTS] Step 1/4: Planner 分析代码库...
-[ANTS] 任务清单已生成，请确认后继续（按 Enter / 输入修改指令）:
-> 把第 3 步改成：只改 API 层，不改数据库层
-[ANTS] 已更新任务 3。继续执行...
-[ANTS] Step 2/4: Coder 读取 src/auth/login.py...
-[ANTS] Step 2 完成。代码修改如下：（输出 diff）
-按 Enter 继续，或输入修改意见:
-> 这个变量名要用 rate_limit_remaining，不要用 remaining_count
-[ANTS] 已注入修改意见，Coder 将在下一步重新生成...
+  - id: security_auditor           # 按需新增的专项 Agent
+    role_file: roles/security_auditor.yaml
+    model: gpt-4o
+    enabled: false
 ```
 
-**方式二：文件注入**（适合异步场景）
+### 5.2 动态新增 Agent
 
-在运行目录创建 `.ants_inject` 文件，Orchestrator 每步前检查：
+**何时需要新增**：任务规划时 Planner 发现当前注册的 Agent 角色不够用
+（如项目新增了移动端需求，需要 iOS Coder）。
+
+新增流程：
+```
+1. 人工在 registry.yaml 中新增条目，填写 role_file 路径
+2. 在 .ants/agents/roles/ 下创建对应的角色定义文件（见第 7 节）
+3. 重启 Orchestrator 或在阶段边界热重载（Orchestrator 在每个阶段开始时重新读取 registry）
+4. Planner 在下次规划时即可将任务分配给新 Agent
+```
+
+### 5.3 动态减少 Agent
+
+**何时需要减少**：某类任务在本项目中不存在（如纯前端项目不需要 DBA Agent）。
+
+减少方式：
+- 将 `registry.yaml` 中对应条目的 `enabled` 设为 `false`
+- 无需删除角色文件，保留以备将来使用
+- Orchestrator 会跳过 disabled 的 Agent；若 Planner 误分配到 disabled Agent，Orchestrator 报错并请求人工确认
+
+### 5.4 Orchestrator 的 Agent 加载逻辑
 
 ```
-# .ants_inject（人工创建此文件即触发注入）
-INJECT: 请在修改前先写单元测试
-```
-
-Orchestrator 读取后删除该文件，将内容注入下一个 Agent 的上下文。
-
-**方式三：Web UI**（后续迭代）
-
-运行时启动本地 Web 服务，提供可视化任务进度和实时干预界面。
-
-### 5.4 纠偏后的一致性保证
-
-纠偏不能只修改一处，还要同步状态：
-
-```
-人工修改指令 → HIL Gateway
-    │
-    ├─► 更新 tasks.json（修改受影响任务的状态为"待重做"）
-    ├─► 清除受影响 Agent 的缓存输出
-    ├─► 记录纠偏日志（correction_log.md：时间 + 原因 + 内容）
-    └─► 通知 Supervisor 从哪一步重新开始
+会话开始
+  │
+  ▼
+读取 registry.yaml → 只加载 enabled=true 的 Agent
+  │
+  ▼
+每个阶段开始时检查 registry 变更（热重载）
+  │
+  ▼
+Planner 只能将任务分配给当前已注册且 enabled 的 Agent
 ```
 
 ---
 
-## 6. 最小可验证设计（MVP）详细设计
+## 6. 人工干预机制（阶段边界模型）
+
+**核心原则：人工在阶段与阶段之间介入，而不是在 AI 执行过程中随意打断。**
+
+AI 执行过程中随意注入指令会导致：Agent 上下文不一致、任务状态混乱、输出难以追溯。
+正确的做法是让 AI 把当前阶段走完，在明确的"检查点"交给人工审批。
+
+### 6.1 阶段与检查点
+
+一次完整任务被划分为若干**阶段（Phase）**，每个阶段结束后系统自动暂停等待人工审批：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 1: 规划阶段                                                    │
+│  Planner 分析代码库，生成任务清单                                      │
+│                      ↓                                               │
+│  ⏸ 检查点 A ── 人工审批 ──────────────────────────────────────────  │
+│  展示：任务清单                                                        │
+│  人工可以：✅ 确认继续 │ ✏️ 修改任务（增/删/改）│ 🛑 终止             │
+└─────────────────────────────────────────────────────────────────────┘
+          ↓ 确认后
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 2: 执行阶段                                                    │
+│  Coder 并行执行所有编码任务（AI 全自主，不接受中途打断）                  │
+│                      ↓                                               │
+│  ⏸ 检查点 B ── 人工审批 ──────────────────────────────────────────  │
+│  展示：所有文件 diff、修改摘要                                          │
+│  人工可以：✅ 确认继续 │ 🔄 要求重做（附上原因）│ 🛑 终止             │
+└─────────────────────────────────────────────────────────────────────┘
+          ↓ 确认后
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 3: 验证阶段                                                    │
+│  Reviewer 审查代码，Tester 运行测试（AI 全自主）                        │
+│                      ↓                                               │
+│  ⏸ 检查点 C ── 人工审批 ──────────────────────────────────────────  │
+│  展示：审查报告、测试结果                                               │
+│  人工可以：✅ 接受交付 │ 🔄 要求修复（退回 Phase 2）│ 🛑 终止         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 人工在检查点可做的操作
+
+| 操作 | 命令 | 含义 |
+|------|------|------|
+| 确认继续 | `approve` / Enter | 当前阶段结果满意，进入下一阶段 |
+| 要求重做 | `redo <原因>` | 当前阶段输出不满意，AI 重新执行本阶段（携带原因） |
+| 修改任务后继续 | `edit` 进入编辑器 | 仅在检查点 A 可用；直接编辑 tasks.json |
+| 终止 | `abort` | 立即停止，保存当前会话状态，可稍后恢复 |
+
+### 6.3 紧急停止（仅限异常）
+
+如果 AI 执行过程中出现明显错误（如误删文件、死循环），人工可发送 `Ctrl+C`：
+- Orchestrator 捕获中断信号
+- **等待当前 Agent 的当前 LLM 调用完成**（不强制中断 LLM，避免半截输出）
+- 将会话状态保存为 `paused`，下次可从当前阶段重新开始
+- 不允许在 paused 状态下修改已完成的任务输出，只能 abort 或 resume
+
+### 6.4 人工审批记录
+
+每次检查点的人工决策记录在 `human_log.md`：
+
+```markdown
+## 检查点 A — 2026-03-02 10:30:15
+**操作**：approve
+**备注**：任务清单看起来合理，第 3 步要注意不改数据库层
+
+## 检查点 B — 2026-03-02 10:45:02
+**操作**：redo
+**原因**：登录函数没有处理 token 过期的情况，需要补上
+```
+
+---
+
+## 7. Agent 角色定义与自我进化
+
+### 7.1 角色定义文件
+
+每个 Agent 的角色定义存储在 `.ants/agents/roles/<name>.yaml`，
+这是 Agent 行为的唯一配置来源，所有角色文件由人工创建和维护（初始版），
+并由 Agent 自身追加项目经验（进化部分）。
+
+```yaml
+# .ants/agents/roles/coder.yaml
+
+name: Coder
+description: 根据任务描述生成或修改代码，保证最小变更
+
+# 固定部分（人工维护）
+system_prompt: |
+  你是一名经验丰富的软件工程师。
+  你的职责是根据任务描述，在不破坏现有功能的前提下，做最小必要的代码修改。
+  修改前必须先阅读 session_memory.md 了解当前进展。
+  输出格式：先说明修改思路，再给出完整的文件 diff。
+
+tools_allowed:
+  - read_file
+  - write_file
+  - search_code
+  - run_shell      # 仅用于运行格式化工具（black/prettier 等）
+
+constraints:
+  - 不能修改任务范围以外的文件
+  - 不能引入新的第三方依赖（除非任务明确要求）
+  - 每次只修改一个文件，多文件改动拆分为多个任务
+
+# 进化部分（Agent 自动追加，人工可审阅）
+# 格式：每条经验一个条目，包含来源会话 ID 和日期
+project_lessons:
+  - session: session_20260301_001
+    date: 2026-03-01
+    lesson: "该项目使用 black 格式化，每次写完代码后运行 black {file_path}"
+  - session: session_20260302_003
+    date: 2026-03-02
+    lesson: "src/auth/ 下的所有函数必须写 docstring，否则 Reviewer 会打回"
+```
+
+### 7.2 角色目录结构
+
+```
+.ants/agents/
+├── registry.yaml           # Agent 注册表（见第 5 节）
+└── roles/
+    ├── planner.yaml
+    ├── coder.yaml
+    ├── reviewer.yaml
+    ├── tester.yaml
+    └── <custom_role>.yaml  # 按需新增
+```
+
+### 7.3 Agent 如何自我进化
+
+进化的本质是：**Agent 把"本次任务中学到的项目专有知识"写回自己的角色文件**，
+下次执行同类任务时自动带上这些经验，不需要人重新说明。
+
+**进化触发时机**：每个阶段结束、Supervisor 审核通过后，Agent 执行"经验提炼"步骤：
+
+```
+Agent 完成阶段任务
+    │
+    ▼
+Supervisor 通过质检
+    │
+    ▼
+Agent 执行 reflect()：
+  - 回顾本次任务中遇到的项目专有规律
+  - 判断是否值得记录（通用经验不记，项目专有的记）
+  - 将经验以结构化条目追加到 roles/<name>.yaml 的 project_lessons 部分
+    │
+    ▼
+经验写入 project_state/agent_lessons.json（跨会话持久）
+```
+
+**经验的去重与清理**：
+- 新经验追加前，Agent 检查是否与已有条目语义重复（LLM 判断）
+- 每个 Agent 的 `project_lessons` 最多保留 20 条；超出时删除最旧的
+- 人工可随时审阅并手动删除错误的经验条目
+
+### 7.4 Orchestrator 如何加载角色
+
+```
+会话开始
+  │
+  ▼
+读取 registry.yaml，得到所有 enabled Agent 列表
+  │
+  ▼
+对每个 Agent：读取 roles/<name>.yaml
+  │  合并 system_prompt + project_lessons（加载最近 10 条，控制 context 大小）→ 完整 system prompt
+  ▼
+Agent 实例化完成，带有项目历史经验
+```
+
+---
+
+## 8. 最小可验证设计（MVP）详细设计
 
 > **MVP 目标**：用最少代码，端到端跑通一个真实场景，证明核心机制有效。
 
-### 6.1 MVP 范围
+### 8.1 MVP 范围
 
 仅实现以下内容，其余全部推后：
 
@@ -285,46 +516,49 @@ Orchestrator 读取后删除该文件，将内容注入下一个 Agent 的上下
 |------|--------|
 | Planner + Coder + Reviewer 三个 Agent | Tester Agent（暂用人工验证） |
 | SQLite 任务状态存储 | Redis / Kafka |
-| 代码库文件索引（JSON） | 向量数据库 |
-| 命令行人工干预（交互模式） | Web UI |
+| `.ants/` 共享资料目录结构 | 向量数据库 |
+| Agent 注册表（registry.yaml）+ 角色文件 | 热重载 / 动态注册 API |
+| 阶段边界人工审批（CLI 交互） | Web UI |
 | 结构化日志（文件） | OpenTelemetry |
 | MCP 工具：read/write/search/run_shell | 复杂权限控制 |
+| Agent 经验追加到 project_lessons | 自动去重 / 经验蒸馏 |
 
-### 6.2 目录结构
+### 8.2 目录结构
 
 ```
 ants/
 ├── ants/                       # 核心包
 │   ├── __init__.py
-│   ├── orchestrator.py         # 编排器（调度 + 干预检测）
+│   ├── orchestrator.py         # 编排器（调度 + 阶段边界审批）
 │   ├── supervisor.py           # 质检 Agent
 │   ├── agents/
 │   │   ├── base.py             # BaseAgent 抽象
-│   │   ├── planner.py          # 任务规划 Agent
-│   │   ├── coder.py            # 编码 Agent
-│   │   └── reviewer.py         # 审查 Agent
+│   │   ├── loader.py           # 从 registry.yaml 加载 Agent
+│   │   ├── planner.py
+│   │   ├── coder.py
+│   │   └── reviewer.py
 │   ├── context/
-│   │   ├── shared_context.py   # 共享资料读写接口
-│   │   ├── codebase_index.py   # 代码库索引建立与查询
-│   │   └── session_memory.py   # 会话记忆
+│   │   ├── shared_context.py   # 共享资料读写接口（对应 .ants/ 目录）
+│   │   └── codebase_index.py   # 代码库索引建立与查询
 │   ├── hil/
-│   │   └── gateway.py          # 人工干预网关
+│   │   └── checkpoint.py       # 阶段边界人工审批（replace old gateway）
 │   ├── tools/
-│   │   ├── file_tools.py       # read_file / write_file
-│   │   ├── code_tools.py       # search_code / run_shell
-│   │   └── git_tools.py        # git_diff / git_log
+│   │   ├── file_tools.py
+│   │   ├── code_tools.py
+│   │   └── git_tools.py
 │   └── storage/
-│       └── sqlite_store.py     # SQLite 任务状态存储
-├── cli.py                      # 命令行入口
-├── config.yaml                 # 配置（LLM 模型、路径等）
+│       └── sqlite_store.py
+├── cli.py
+├── config.yaml
 ├── pyproject.toml
 └── tests/
     ├── test_orchestrator.py
-    ├── test_hil_gateway.py
-    └── test_shared_context.py
+    ├── test_checkpoint.py
+    ├── test_shared_context.py
+    └── test_agent_loader.py
 ```
 
-### 6.3 核心数据结构
+### 8.3 核心数据结构
 
 #### 任务（Task）
 
@@ -334,17 +568,17 @@ class Task:
     id: str                          # 唯一 ID，如 "task_001"
     title: str                       # 简短描述
     description: str                 # 详细说明
-    assigned_agent: str              # 负责 Agent 类型
-    depends_on: list[str]            # 依赖的任务 ID
+    assigned_agent: str              # 负责 Agent ID（对应 registry.yaml）
+    phase: int                       # 所属阶段编号（1=规划, 2=执行, 3=验证）
+    depends_on: list[str]            # 依赖的任务 ID（空列表 = 可立即执行）
     status: Literal[
-        "pending",                   # 待执行
-        "in_progress",               # 执行中
-        "completed",                 # 完成
-        "needs_redo",                # 被人工/Supervisor 标记重做
-        "skipped"                    # 跳过
+        "pending",
+        "in_progress",
+        "completed",
+        "needs_redo",
+        "skipped"
     ]
-    output: dict | None              # Agent 的输出（完成后填入）
-    correction_notes: list[str]      # 人工纠偏记录
+    output: dict | None
     created_at: str
     completed_at: str | None
 ```
@@ -363,169 +597,127 @@ class Session:
     created_at: str
 ```
 
-### 6.4 各模块详细设计
+### 8.4 各模块详细设计
 
-#### 6.4.1 SharedContext（共享资料层）
+#### 8.4.1 SharedContext（共享资料层）
 
 ```python
 class SharedContext:
-    """所有 Agent 通过此类读写共享资料，避免直接操作文件。"""
+    """所有 Agent 通过此类读写 .ants/ 目录，禁止直接操作文件。"""
 
-    def __init__(self, session_dir: str):
-        self.session_dir = session_dir
-        # 固定文件路径
-        self.tasks_file      = f"{session_dir}/tasks.json"
-        self.codebase_index  = f"{session_dir}/codebase_index.json"
-        self.session_memory  = f"{session_dir}/session_memory.md"
-        self.correction_log  = f"{session_dir}/correction_log.md"
+    def __init__(self, project_root: str, session_id: str):
+        self.knowledge_dir    = f"{project_root}/.ants/knowledge"
+        self.project_state    = f"{project_root}/.ants/project_state"
+        self.session_dir      = f"{project_root}/.ants/sessions/{session_id}"
 
+    # 任务管理
     def read_tasks(self) -> list[Task]: ...
     def update_task(self, task_id: str, **kwargs): ...
 
-    def read_codebase_index(self) -> dict: ...
+    # 代码库索引（只读，由 Planner 建立）
     def search_code(self, query: str, top_k: int = 5) -> list[dict]: ...
+    def get_file_context(self, path: str, symbol: str = None) -> str: ...
 
-    def append_memory(self, agent: str, content: str): ...
-    def read_memory(self) -> str: ...      # 返回完整的 session_memory.md
+    # 会话记忆（追加，不覆盖）
+    def append_memory(self, agent_id: str, content: str): ...
+    def read_memory(self) -> str: ...
 
-    def log_correction(self, note: str): ...
+    # 知识读取（只读）
+    def read_knowledge(self, filename: str) -> str: ...
+
+    # 人工审批记录
+    def log_human_decision(self, checkpoint: str, action: str, note: str): ...
 ```
-
-每个 Agent 在执行前调用 `read_memory()` 获取已发生的上下文摘要，
-执行后调用 `append_memory()` 追加自己的输出摘要。
-
-#### 6.4.2 CodebaseIndex（代码库索引）
-
-```python
-class CodebaseIndex:
-    """为老项目维护场景建立代码快速检索能力。"""
-
-    def build(self, project_path: str) -> dict:
-        """
-        遍历项目，对每个代码文件提取：
-        1. 文件路径
-        2. 符号列表（函数名/类名，用 ast.parse 或 tree-sitter）
-        3. 文件大小（超过 500 行的标记为"大文件"）
-        4. 最后修改时间
-        结果写入 codebase_index.json
-        """
-
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
-        """
-        BM25 关键词检索 + 符号名称精确匹配，返回最相关文件列表。
-        query 示例："登录验证 JWT"  →  返回 src/auth/login.py 等
-        """
-
-    def get_file_context(self, file_path: str, symbol: str = None) -> str:
-        """
-        读取文件内容。如果 symbol 不为空，只返回该函数/类的代码片段。
-        避免向 Agent 传入整个大文件。
-        """
-```
-
-#### 6.4.3 HILGateway（人工干预网关）
-
-```python
-class HILGateway:
-    """
-    人工干预网关。Orchestrator 在每次调度前调用 check()。
-    """
-
-    INJECT_FILE = ".ants_inject"
-
-    async def check(self, session: Session) -> HILAction | None:
-        """
-        检查是否有人工干预指令。返回 None 表示无干预，继续执行。
-        """
-        # 1. 检查 .ants_inject 文件
-        if os.path.exists(self.INJECT_FILE):
-            content = open(self.INJECT_FILE).read().strip()
-            os.remove(self.INJECT_FILE)
-            return HILAction(type="inject", content=content)
-
-        # 2. 如果是交互模式，在 checkpoint 处等待用户输入
-        if self.interactive and self._at_checkpoint(session):
-            return await self._prompt_user(session)
-
-        return None
-
-    async def _prompt_user(self, session: Session) -> HILAction | None:
-        """
-        在终端展示当前进度，等待用户输入。
-        支持：Enter（继续）、修改指令、pause、abort
-        """
-
-@dataclass
-class HILAction:
-    type: Literal["inject", "replace_task", "rollback_to", "pause", "abort", "resume"]
-    content: str = ""
-    target_task_id: str = ""
-```
-
-#### 6.4.4 Orchestrator（编排器）
 
 ```python
 class Orchestrator:
     """
-    核心调度循环。按依赖顺序执行任务，每步前检查 HIL 干预。
+    核心调度循环。按阶段执行任务，阶段边界等待人工审批。
+    同一阶段内无依赖的任务并行执行。
     """
 
     async def run(self, session: Session):
-        while not session.is_done():
+        for phase in self._get_phases(session):
 
-            # 1. 检查人工干预
-            action = await self.hil.check(session)
-            if action:
-                await self._apply_hil_action(action, session)
+            # 并行执行本阶段所有就绪任务
+            await self._run_phase(phase, session)
+
+            # 阶段完成后请求人工审批
+            summary = self._summarize_phase(phase, session)
+            decision = await self.checkpoint.request_approval(
+                phase=phase.number, summary=summary, ctx=session.ctx
+            )
+
+            if decision.action == "abort":
+                session.status = "aborted"
+                return
+            elif decision.action == "redo":
+                self._reset_phase(phase, session, reason=decision.reason)
+                # 重做：退回本阶段，重新执行
                 continue
+            elif decision.action == "edit" and phase.number == 1:
+                # 只有规划阶段（Phase 1）支持编辑任务清单
+                await self._interactive_edit_tasks(session)
 
-            # 2. 找到下一个可执行任务（依赖已满足的 pending 任务）
-            task = self._next_ready_task(session)
-            if not task:
-                await asyncio.sleep(0.5)
-                continue
+            session.ctx.log_human_decision(f"phase_{phase.number}",
+                                           decision.action, decision.reason)
 
-            # 3. 标记为进行中
-            session.ctx.update_task(task.id, status="in_progress")
+    async def _run_phase(self, phase, session: Session):
+        """并行执行同一阶段内互不依赖的任务批次。"""
+        while True:
+            ready = self._get_ready_tasks(phase, session)
+            if not ready:
+                break
+            # 同一批次内并发执行
+            await asyncio.gather(*[
+                self._run_task(task, session) for task in ready
+            ])
 
-            # 4. 调用对应 Agent
-            agent = self.agents[task.assigned_agent]
-            result = await agent.invoke(task, session.ctx)
-
-            # 5. Supervisor 质检
-            verdict = await self.supervisor.check(task, result)
-            if not verdict.passed:
-                session.ctx.update_task(task.id, status="needs_redo",
-                                        correction_notes=[verdict.reason])
-                continue
-
-            # 6. 完成
+    async def _run_task(self, task: Task, session: Session):
+        session.ctx.update_task(task.id, status="in_progress")
+        agent = self.agents[task.assigned_agent]
+        result = await agent.invoke(task, session.ctx)
+        verdict = await self.supervisor.check(task, result)
+        if verdict.passed:
             session.ctx.update_task(task.id, status="completed", output=result)
-            self._log(f"✅ Task {task.id} completed: {task.title}")
+            await agent.reflect(task, result, session.ctx)   # 经验提炼
+        else:
+            session.ctx.update_task(task.id, status="needs_redo")
 ```
 
-#### 6.4.5 BaseAgent 接口
+#### 8.4.4 BaseAgent 接口
 
 ```python
 class BaseAgent:
-    def __init__(self, llm_client, tools: list):
+    def __init__(self, llm_client, role: dict, tools: list):
         self.llm = llm_client
+        self.role = role          # 来自 roles/<name>.yaml
         self.tools = tools
 
     async def invoke(self, task: Task, ctx: SharedContext) -> dict:
         """
         执行一个任务步骤。
         标准流程：
-          1. 读取 session_memory（了解整体进度）
-          2. 读取任务相关的代码/文件（通过 CodebaseIndex）
-          3. 调用 LLM，允许调用工具
-          4. 输出结构化结果
-          5. 追加摘要到 session_memory
+          1. 组装 system_prompt（base + project_lessons 最近 10 条）
+          2. 读取 session_memory（了解整体进度）
+          3. 检索相关代码片段（通过 codebase_index）
+          4. 调用 LLM，允许调用工具
+          5. 输出结构化结果
+          6. 追加摘要到 session_memory
         """
         raise NotImplementedError
+
+    async def reflect(self, task: Task, result: dict, ctx: SharedContext):
+        """
+        经验提炼：任务成功完成后，提炼本次任务中学到的项目专有知识，
+        追加到 project_state/agent_lessons.json 的本 Agent 条目下。
+        """
+        # LLM 判断本次执行是否产生了值得记录的项目专有经验
+        # 如果有，写入 agent_lessons.json
+        pass
 ```
 
-### 6.5 端到端场景演示
+### 8.5 端到端场景演示
 
 #### 场景 A：新项目 — 实现用户注册功能
 
@@ -533,30 +725,39 @@ class BaseAgent:
 $ ants run --goal "在 FastAPI 项目中实现用户注册接口" --project ./my_project
 
 [ANTS] 🔍 扫描代码库...（已有 12 个文件）
-[ANTS] 📋 Planner 生成任务清单：
-  task_001: 分析现有用户模型和数据库配置      [Planner]
-  task_002: 设计注册接口（路由 + 请求体）      [Planner]
-  task_003: 实现注册逻辑（含密码 Hash）        [Coder]   依赖: task_002
-  task_004: 代码审查                           [Reviewer] 依赖: task_003
 
-[ANTS] ⏸ 任务清单已就绪，请确认（Enter 继续 / 输入修改意见）:
-> 第 3 步要加邮件验证逻辑
-[ANTS] 已更新 task_003。
-[ANTS] ▶ 执行 task_001...
-[ANTS] ✅ task_001 完成
-[ANTS] ▶ 执行 task_002...
-[ANTS] ✅ task_002 完成
-[ANTS] ▶ 执行 task_003...（Coder 正在生成代码）
-[ANTS] ✅ task_003 完成，修改了 2 个文件：
-  + src/api/users.py（新增 register 路由）
-  + src/services/auth.py（新增 send_verification_email）
+━━━━━━━━━━━━━━━━━━ Phase 1: 规划 ━━━━━━━━━━━━━━━━━━
+[ANTS] Planner 生成任务清单：
+  task_001 [phase=2]: 实现注册路由        [Coder]
+  task_002 [phase=2]: 实现密码 Hash 工具  [Coder]   （与 task_001 无依赖，可并行）
+  task_003 [phase=2]: 实现邮件验证逻辑    [Coder]   depends_on: task_001
+  task_004 [phase=3]: 代码审查            [Reviewer] depends_on: task_001,002,003
 
-按 Enter 继续代码审查，或输入意见:
-> 邮件模板要用中文
-[ANTS] 已注入意见，Reviewer 将带入此上下文...
-[ANTS] ▶ 执行 task_004...（Reviewer 审查中）
-[ANTS] ✅ 审查通过，共 2 条建议（已记录到 review.json）
-[ANTS] 🎉 全部完成！查看输出：./my_project/.ants/session_001/
+⏸  Phase 1 完成，请审批后继续
+操作：[Enter] 批准继续 | [r] 重做本阶段 | [e] 编辑任务 | [q] 终止
+> e
+（打开 tasks.json 编辑器，人工把邮件验证的语言改为"中文模板"）
+> （保存退出）
+[ANTS] 任务已更新，继续执行。
+
+━━━━━━━━━━━━━━━━━━ Phase 2: 执行 ━━━━━━━━━━━━━━━━━━
+[ANTS] ▶ 并行执行 task_001 + task_002...
+[ANTS] ✅ task_001 完成 | ✅ task_002 完成
+[ANTS] ▶ 执行 task_003（依赖已满足）...
+[ANTS] ✅ task_003 完成
+
+⏸  Phase 2 完成，请审批后继续
+展示：修改的 3 个文件 diff
+操作：[Enter] 批准继续 | [r] 重做本阶段 | ...
+> （Enter）
+
+━━━━━━━━━━━━━━━━━━ Phase 3: 验证 ━━━━━━━━━━━━━━━━━━
+[ANTS] ▶ Reviewer 审查代码...
+[ANTS] ✅ 审查通过，2 条建议已记录。
+
+⏸  Phase 3 完成，请审批后继续
+> （Enter）
+[ANTS] 🎉 全部完成！输出：./my_project/.ants/sessions/session_001/
 ```
 
 #### 场景 B：维护老项目 — 修复登录超时问题
@@ -564,30 +765,35 @@ $ ants run --goal "在 FastAPI 项目中实现用户注册接口" --project ./my
 ```
 $ ants run --goal "修复用户反馈的登录 30 秒超时问题" --project ./legacy_project
 
-[ANTS] 🔍 建立代码库索引（共 87 个文件）...
-[ANTS] 📋 Planner 生成任务清单：
-  task_001: 定位登录相关代码（搜索 login, auth, timeout）  [Planner]
-  task_002: 分析超时原因（数据库查询？外部 API？）          [Planner]
-  task_003: 修复超时问题                                    [Coder]   依赖: task_002
-  task_004: 验证修复（检查相关测试）                         [Reviewer] 依赖: task_003
+[ANTS] 🔍 更新代码库索引（共 87 个文件）...
 
-[ANTS] ▶ 执行 task_001...
-[ANTS] 🔍 搜索到相关文件：
-  - src/auth/login_handler.py（含 login(), _validate_session()）
-  - src/db/user_repository.py（含 find_by_email()）
-  - config/timeouts.py
+━━━━━━━━━━━━━━━━━━ Phase 1: 规划 ━━━━━━━━━━━━━━━━━━
+[ANTS] Planner 分析，搜索 login, auth, timeout 相关文件...
+[ANTS] 定位到：src/auth/login_handler.py, src/db/user_repository.py
+[ANTS] 根因：find_by_email() 全表扫描。修复方案：加 Redis 缓存
 
-[ANTS] ▶ 执行 task_002...
-[ANTS] 分析结果：find_by_email() 缺少索引，全表扫描导致超时。
+任务清单：
+  task_001 [phase=2]: 在 user_repository.py 的 find_by_email 加缓存  [Coder]
+  task_002 [phase=3]: 运行登录相关测试，确认无破坏                    [Reviewer]
 
-[ANTS] ⏸ 确认修复方向（Enter 继续 / 输入意见）:
-> 不要直接加数据库索引，先加缓存，索引让 DBA 评审后再加
-[ANTS] 已更新修复策略。
-[ANTS] ▶ 执行 task_003...（Coder 添加 Redis 缓存）
-...
+⏸  Phase 1 完成，请审批后继续
+操作：[Enter] 批准继续 | [e] 编辑任务 | [q] 终止
+> （Enter，确认修复方向）
+
+━━━━━━━━━━━━━━━━━━ Phase 2: 执行 ━━━━━━━━━━━━━━━━━━
+[ANTS] ▶ Coder 修改 user_repository.py（Coder 的 project_lessons 已包含：
+        "该项目 Redis 客户端实例在 src/utils/cache.py"）
+[ANTS] ✅ task_001 完成，变更 12 行
+
+⏸  Phase 2 完成，diff 如下：...
+> （Enter）
+
+━━━━━━━━━━━━━━━━━━ Phase 3: 验证 ━━━━━━━━━━━━━━━━━━
+[ANTS] ✅ 回归测试全部通过
+[ANTS] 🎉 完成！
 ```
 
-### 6.6 关键配置（config.yaml）
+### 8.6 关键配置（config.yaml）
 
 ```yaml
 llm:
@@ -599,36 +805,38 @@ project:
   default_path: "."
   index_cache_ttl: 3600           # 代码索引缓存时间（秒）
 
-hil:
-  interactive: true               # 是否开启交互式干预
-  checkpoint_after:               # 哪些步骤后自动暂停等待确认
-    - planning_done
-    - code_generated
+phases:
+  checkpoints:                    # 哪些阶段边界暂停等待人工审批
+    - 1                           # 规划完成后（必须）
+    - 2                           # 执行完成后（必须）
+    - 3                           # 验证完成后（可选）
 
 budget:
-  max_steps: 30                   # 最大任务步数
-  max_tokens: 50000               # 最大 Token 消耗
+  max_steps: 30
+  max_tokens: 50000
 
 output:
-  session_dir: ".ants"            # 会话数据保存目录
+  session_dir: ".ants/sessions"
   log_level: INFO
 ```
 
-### 6.7 验证标准
+### 8.7 验证标准
 
 MVP 跑通的判断标准：
 
 | 验证点 | 期望结果 |
 |--------|----------|
-| 新项目场景（场景 A） | 能生成可运行的代码，代码审查通过 |
+| 新项目场景（场景 A） | 能生成可运行的代码，审查通过 |
 | 老项目场景（场景 B） | 能定位到正确文件并生成精准 diff |
-| 资料共享 | 后一个 Agent 的输出基于前一个 Agent 的结果 |
-| 人工干预 | 注入意见后，下一个 Agent 的输出体现该意见 |
-| 任务重做 | Supervisor 打回后，Agent 重新生成不同的输出 |
+| 并行执行 | 无依赖的任务被并行调度，有依赖的等待前置完成 |
+| 共享资料 | 后一个 Agent 的输出基于前一个的 session_memory |
+| 阶段边界审批 | Phase 完成后自动暂停，AI 执行中不被打断 |
+| Agent 注册 | disabled Agent 不被调度；新增 Agent 后热重载生效 |
+| 经验进化 | 第 2 次运行时 project_lessons 中有上次任务的经验条目 |
 
 ---
 
-## 7. 与完整版的关系
+## 9. 与完整版的关系
 
 Lite 版不是替代，而是完整版的**第一阶段**：
 
@@ -652,4 +860,4 @@ Phase 3: 加入向量记忆、Web UI、A2A 跨框架支持
 
 ---
 
-*文档为精简方案设计草案，欢迎通过 Issue 或 PR 提出修改建议。*
+*文档为精简方案设计草案（v0.2），欢迎通过 Issue 或 PR 提出修改建议。*
