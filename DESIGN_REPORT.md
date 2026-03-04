@@ -168,7 +168,8 @@
 | **主要场景** | 快速原型 | 企业工作流 | 对话/研究 | 软件开发 | 学习 | 企业插件 |
 | **GitHub Stars** | ~25k | ~10k+ | ~33k+ | ~64k+ | — | ~24k+ |
 
-> 注：Stars 数据截止 2024-2025 年初，仅供参考趋势判断。
+> 注：Stars 数据截止 2024–2025 年初，仅供参考趋势判断。  
+> 2025–2026 年框架更新（OpenAI Agents SDK、Google ADK、Microsoft Agent Framework、CrewAI Flows 企业版等）请参阅 [AGENT_LANDSCAPE_2025_2026.md](./AGENT_LANDSCAPE_2025_2026.md)。
 
 ---
 
