@@ -8,3 +8,4 @@
 - [完整设计报告](./DESIGN_REPORT.md) — 框架调研、痛点分析与完整设计方案（含参考来源）
 - [Agent 协作平台洞察报告：2025–2026](./AGENT_LANDSCAPE_2025_2026.md) — 最新框架全景、MCP/A2A 协议生态、与 ANTS 需求的差距分析及选型建议
 - [Agent 自我进化系统](./AGENT_EVOLUTION.md) — 项目级经验积累机制详细设计
+- [LangGraph & Google ADK 实现方案](./IMPLEMENTATION_PLAN.md) — 基于 LangGraph 和 Google ADK 的详细实现方案，含渐进式披露（Progressive Disclosure）经验加载策略与 MVP 验证计划
