@@ -43,4 +43,6 @@ async def setup_session(state: ANTSState) -> dict:
         "session_memory": memory_line,
         "experience_budget_used": 0,
         "injected_experience_ids": [],
+        "agent_plan": [],
+        "loaded_skill_names": [],
     }

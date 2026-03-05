@@ -4,6 +4,7 @@ from .planner import PlannerAgent
 from .coder_pool import CoderAgent, CoderAgentPool
 from .verify_pool import ReviewerAgent, TesterAgent, VerifyAgentPool
 from .hitl_tool import HumanApprovalTool
+from .subagent import SubAgent
 
 __all__ = [
     "OrchestratorAgent",
@@ -14,4 +15,6 @@ __all__ = [
     "TesterAgent",
     "VerifyAgentPool",
     "HumanApprovalTool",
+    "SubAgent",
 ]
+
