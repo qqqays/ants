@@ -9,3 +9,4 @@
 - [Agent 协作平台洞察报告：2025–2026](./AGENT_LANDSCAPE_2025_2026.md) — 最新框架全景、MCP/A2A 协议生态、与 ANTS 需求的差距分析及选型建议
 - [Agent 自我进化系统](./AGENT_EVOLUTION.md) — 项目级经验积累机制详细设计
 - [LangGraph & Google ADK 实现方案](./IMPLEMENTATION_PLAN.md) — 基于 LangGraph 和 Google ADK 的详细实现方案，含渐进式披露（Progressive Disclosure）经验加载策略与 MVP 验证计划
+- [Skills、问题文档与 Agent Plan 设计方案](./SKILLS_AND_AGENT_PLAN.md) — Skills 系统、ProblemDocument、SubAgent 和动态 AgentPlan 的设计说明与改动点（最新）

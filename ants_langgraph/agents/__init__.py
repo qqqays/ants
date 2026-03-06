@@ -4,5 +4,7 @@ from .planner import PlannerAgent
 from .coder import CoderAgent
 from .reviewer import ReviewerAgent
 from .tester import TesterAgent
+from .subagent import SubAgent
 
-__all__ = ["BaseAgent", "PlannerAgent", "CoderAgent", "ReviewerAgent", "TesterAgent"]
+__all__ = ["BaseAgent", "PlannerAgent", "CoderAgent", "ReviewerAgent", "TesterAgent", "SubAgent"]
+
